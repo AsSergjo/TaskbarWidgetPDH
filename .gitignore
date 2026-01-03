@@ -1,0 +1,30 @@
+# Compiled binaries
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# Build directories
+build/
+x64/
+Debug/
+Release/
+
+# IDE files
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.suo
+*.user
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
