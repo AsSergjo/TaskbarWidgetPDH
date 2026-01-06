@@ -137,16 +137,16 @@ void UpdateLayeredPopup(HWND hwnd) {
 const wchar_t* formatNetSpeed(double net) {
     static wchar_t netStr[32];
    
-if (net >= 100000.0) {
+if (net >= 1000.0) {//уже net в КБ
     // Конвертируем в МБ/с (1 МБ = 1024 КБ)
     double netMB = net / 1024.0;
-    swprintf_s(netStr, sizeof(netStr)/sizeof(netStr[0]), L"%5.1f MB/s", netMB);
-} else if (net >= 1000.0) {
+    swprintf_s(netStr, sizeof(netStr)/sizeof(netStr[0]), L"%6.1f MB/s", netMB);
+} else if (net >= 100.0) {
     // Можно показывать с одним десятичным знаком для больших значений в КБ/с
-    swprintf_s(netStr, sizeof(netStr)/sizeof(netStr[0]), L"%5.0f KB/s", net);
+    swprintf_s(netStr, sizeof(netStr)/sizeof(netStr[0]), L"%6.1f KB/s", net);
 } else {
     // Для значений меньше 1000 показываем без десятичных
-    swprintf_s(netStr, sizeof(netStr)/sizeof(netStr[0]), L"%5.0f KB/s", net);
+    swprintf_s(netStr, sizeof(netStr)/sizeof(netStr[0]), L"%6.1f KB/s", net);
 }
 
     return netStr;
@@ -245,7 +245,7 @@ std::wstring GetMetricsText() {
 
     wchar_t buf[128];
     swprintf_s(buf, sizeof(buf)/sizeof(buf[0]),
-    L"%s D:%02.0f\n  CPU:%02.0f RAM:%02.0f", formatNetSpeed(net), disk, cpu, mem);
+    L"%s D:%3.1f\n CPU:%4.1f RAM:%3.0f", formatNetSpeed(net), disk, cpu, mem);
     return std::wstring(buf);
 }
 
@@ -346,7 +346,7 @@ void UpdatePopupPositionNow() {
 
 HFONT CreateMono15Light()
 {    
-    return CreateFontW(
+     return CreateFontW(
     -12,              // !!!
     0, 0, 0,
     400,
@@ -356,8 +356,8 @@ HFONT CreateMono15Light()
     CLIP_DEFAULT_PRECIS,
     ANTIALIASED_QUALITY,
     FIXED_PITCH,
-    L"Courier New"
-);
+    L"Courier New");
+    
 }
 
 LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
