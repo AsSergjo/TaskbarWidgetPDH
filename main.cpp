@@ -9,6 +9,7 @@
 #include <cmath>
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "shell32.lib")
@@ -203,25 +204,45 @@ PDH_STATUS InitPDH() {
         hNetUp = nullptr;
 
     PdhCollectQueryData(hQuery);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     PdhCollectQueryData(hQuery);
     return ERROR_SUCCESS;
 }
 
+// --------------------------------------------------------------------------
+// Суммирует значения wildcard-счётчика по всем интерфейсам
+// --------------------------------------------------------------------------
+static double SumCounterArray(PDH_HCOUNTER hCounter) {
+    if (!hCounter) return 0.0;
+
+    DWORD bufSize = 0, itemCount = 0;
+    PDH_STATUS st = PdhGetFormattedCounterArray(hCounter, PDH_FMT_DOUBLE,
+                                                &bufSize, &itemCount, nullptr);
+    if (st != (PDH_STATUS)0x800007D2L && st != ERROR_SUCCESS)
+        return 0.0;
+
+    std::vector<BYTE> buf(bufSize);
+    auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
+    st = PdhGetFormattedCounterArray(hCounter, PDH_FMT_DOUBLE,
+                                     &bufSize, &itemCount, items);
+    if (st != ERROR_SUCCESS)
+        return 0.0;
+
+    double total = 0.0;
+    for (DWORD i = 0; i < itemCount; ++i) {
+        double val = items[i].FmtValue.doubleValue;
+        if (val >= 0.0 && !std::isnan(val) && !std::isinf(val))
+            total += val;
+    }
+    return total;
+}
+
 std::wstring GetMetricsText() {
     PdhCollectQueryData(hQuery);
-    PDH_FMT_COUNTERVALUE v;
-    double netDown = 0.0, netUp = 0.0;
 
-    if (hNetDown &&
-        PdhGetFormattedCounterValue(hNetDown, PDH_FMT_DOUBLE, nullptr, &v) == ERROR_SUCCESS &&
-        v.doubleValue >= 0.0 && !std::isnan(v.doubleValue) && !std::isinf(v.doubleValue))
-        netDown = v.doubleValue / 1024.0;
-
-    if (hNetUp &&
-        PdhGetFormattedCounterValue(hNetUp, PDH_FMT_DOUBLE, nullptr, &v) == ERROR_SUCCESS &&
-        v.doubleValue >= 0.0 && !std::isnan(v.doubleValue) && !std::isinf(v.doubleValue))
-        netUp = v.doubleValue / 1024.0;
+    // Суммируем трафик по всем сетевым интерфейсам
+    double netDown = SumCounterArray(hNetDown) / 1024.0;
+    double netUp   = SumCounterArray(hNetUp)   / 1024.0;
 
     wchar_t downUnit = L'K';
     if (netDown >= 1024.0) { netDown /= 1024.0; downUnit = L'M'; }
