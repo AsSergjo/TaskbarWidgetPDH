@@ -1,0 +1,12 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Bottom Window -->
+  <rect x="50" y="60" width="156" height="136" rx="10" ry="10" fill="#555555" stroke="#AAAAAA" stroke-width="6"/>
+
+  <!-- Top Window -->
+  <rect x="60" y="50" width="156" height="136" rx="10" ry="10" fill="#777777" stroke="#FFFFFF" stroke-width="6"/>
+  
+  <!-- Bigger 'switch' arrows, closer together -->
+  <path d="M90 146 L166 146 M166 146 L150 136 M166 146 L150 156" stroke="#EEEEEE" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M166 110 L90 110 M90 110 L106 100 M90 110 L106 120" stroke="#EEEEEE" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+
+</svg>
