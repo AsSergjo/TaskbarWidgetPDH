@@ -1,323 +1,418 @@
-﻿#include <windows.h>
+﻿#define NOMINMAX
+#include <windows.h>
 #include <windowsx.h>
-#include <shellapi.h>
-#include <wchar.h>
+#include <dwmapi.h>
 #include <pdh.h>
 #include <string>
 #include <thread>
 #include <chrono>
 #include <cmath>
 #include <atomic>
-#include <mutex>
 #include <vector>
+#include <algorithm>
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "dwmapi.lib")
 
-#define ID_TIMER_WATCHDOG  1
-#define ID_TIMER_ZORDER    2
-#define IDM_EXIT 101
-#define WM_APP_UPDATE_METRICS (WM_APP + 1)
 #include "resource.h"
 
-HINSTANCE g_hInst;
-HWND g_hPopup = NULL;
-HWND g_hTaskbar = NULL;
-int g_popupWidth = 132;
-int g_popupHeight = 48;
-int g_xOffset = 310;
-int g_yOffset = 0;
-int g_screenHeight = 0;
+// ── IDs ───────────────────────────────────────────────────────────────────────
+#define IDM_EXIT              101
+#define WM_APP_UPDATE_METRICS (WM_APP + 1)
+
+// ── Window geometry ───────────────────────────────────────────────────────────
+static const int WIN_W = 140;
+static const int WIN_H =  62;
+
+// ── Visual style ──────────────────────────────────────────────────────────────
+// Overall window alpha (0-255).  220 ~= 86 % — feels solid but clearly see-through.
+static const BYTE WIN_ALPHA = 220;
+
+// Background colour painted in WM_PAINT (layered alpha makes it semi-transparent)
+// Muted Gray
+static const COLORREF CLR_BG = RGB(60, 62, 66);
+static const COLORREF CLR_BORDER = RGB(100, 105, 115);
+static const COLORREF CLR_DN = RGB(120, 230, 255);
+static const COLORREF CLR_UP = RGB(255, 200, 80);
+static const COLORREF CLR_VAL = RGB(255, 255, 255);
+
+// ── Registry key ──────────────────────────────────────────────────────────────
+static const wchar_t* REG_KEY = L"Software\\NetMonitorWidget";
+
+// ── Globals ───────────────────────────────────────────────────────────────────
+HINSTANCE        g_hInst        = NULL;
+HWND             g_hPopup       = NULL;
+HANDLE           g_hMutex       = NULL;
 CRITICAL_SECTION g_cs;
-PDH_HQUERY hQuery = nullptr;
+
+// Fonts: created once in WM_CREATE, deleted in WM_DESTROY
+HFONT g_hFontArrow = NULL;   // arrow glyph font
+HFONT g_hFontValue = NULL;   // monospaced value font
+
+PDH_HQUERY   hQuery   = nullptr;
 PDH_HCOUNTER hNetDown = nullptr, hNetUp = nullptr;
-HFONT g_hFont = nullptr;
-HANDLE g_hMutex = NULL;
 
-std::atomic<bool> g_keepRunning{ true };
-HANDLE g_updateThread = nullptr;
-std::wstring g_metricsText = L"Loading...";
+std::atomic<bool> g_keepRunning{true};
+HANDLE            g_updateThread = nullptr;
 
-RECT g_lastTaskbarRect = {0};
+// Two separate strings so we can colour them independently in WM_PAINT
+struct NetLine { std::wstring arrow; std::wstring value; };
+NetLine g_lineDown, g_lineUp;
 
-// Хук на события перемещения таскбара
-HWINEVENTHOOK g_hEventHook = nullptr;
+// Drag state
+bool  g_isDragging = false;
+POINT g_dragOffset = {};
 
 LRESULT CALLBACK PopupWndProc(HWND, UINT, WPARAM, LPARAM);
-bool FindTaskbar();
-void UpdatePopupPositionNow();
 
-std::wstring GetMetricsText();
+// ── Registry helpers ──────────────────────────────────────────────────────────
 
-// --------------------------------------------------------------------------
-// Отрисовка через UpdateLayeredWindow
-// --------------------------------------------------------------------------
-void UpdateLayeredPopup(HWND hwnd) {
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-    int width  = rc.right  - rc.left;
-    int height = rc.bottom - rc.top;
-    if (width <= 0 || height <= 0) return;
-    if (!g_hFont) return;
-
-    HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem    = CreateCompatibleDC(hdcScreen);
-    ReleaseDC(NULL, hdcScreen);
-
-    BITMAPINFO bmi = {0};
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = width;
-    bmi.bmiHeader.biHeight      = -height;
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void*   pBits   = NULL;
-    HBITMAP hBitmap = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (!hBitmap) { DeleteDC(hdcMem); return; }
-
-    SelectObject(hdcMem, hBitmap);
-    memset(pBits, 0, width * height * 4);
-
-    SetTextColor(hdcMem, RGB(255, 255, 255));
-    SetBkMode(hdcMem, TRANSPARENT);
-
-    EnterCriticalSection(&g_cs);
-    std::wstring text = g_metricsText;
-    LeaveCriticalSection(&g_cs);
-
-    HFONT hOldFont = (HFONT)SelectObject(hdcMem, g_hFont);
-    RECT rcText = rc;
-    DrawTextW(hdcMem, text.c_str(), -1, &rcText, DT_CALCRECT | DT_WORDBREAK | DT_CENTER);
-    int textHeight = rcText.bottom - rcText.top;
-    int yOff       = (height - textHeight) / 2;
-    RECT rcDraw    = rc;
-    rcDraw.top    += yOff;
-    rcDraw.bottom  = rcDraw.top + textHeight;
-    DrawTextW(hdcMem, text.c_str(), -1, &rcDraw, DT_WORDBREAK | DT_CENTER);
-    SelectObject(hdcMem, hOldFont);
-
-    DWORD* pixels = (DWORD*)pBits;
-    for (int i = 0; i < width * height; ++i) {
-        DWORD pix = pixels[i];
-        BYTE r = (pix >> 16) & 0xFF;
-        BYTE g = (pix >>  8) & 0xFF;
-        BYTE b =  pix        & 0xFF;
-        BYTE brightness = max(max(r, g), b);
-        if (brightness > 0) {
-            BYTE alpha = brightness;
-            if (alpha < 35)
-                alpha = 0;
-            else
-                alpha = (BYTE)((alpha - 35) * 255 / (255 - 35));
-            pixels[i] = (alpha << 24);
-        } else {
-            pixels[i] = 0x01000000;
-        }
-    }
-
-    POINT ptDst = {rc.left, rc.top};
-    SIZE  sizeWnd = {width, height};
-    POINT ptSrc   = {0, 0};
-    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    ClientToScreen(hwnd, &ptDst);
-    UpdateLayeredWindow(hwnd, NULL, &ptDst, &sizeWnd, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
-
-    DeleteObject(hBitmap);
-    DeleteDC(hdcMem);
-}
-
-// --------------------------------------------------------------------------
-// Фоновый поток обновления метрик
-// --------------------------------------------------------------------------
-DWORD WINAPI UpdateThread(LPVOID) {
-    while (g_keepRunning) {
-        std::wstring text = GetMetricsText();
-        EnterCriticalSection(&g_cs);
-        g_metricsText = text;
-        LeaveCriticalSection(&g_cs);
-        if (g_hPopup) {
-            PostMessageW(g_hPopup, WM_APP_UPDATE_METRICS, 0, 0);
-        }
-        Sleep(1000);
-    }
-    return 0;
-}
-
-// --------------------------------------------------------------------------
-// Вспомогательная функция: немедленно поднять виджет поверх таскбара
-// --------------------------------------------------------------------------
-static inline void BringWidgetToTop() {
-    if (g_hPopup)
-        SetWindowPos(g_hPopup, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
-}
-
-// --------------------------------------------------------------------------
-// WinEvent-колбэк: перемещение таскбара (только поток таскбара)
-// --------------------------------------------------------------------------
-void CALLBACK WinEventProcLocation(
-    HWINEVENTHOOK /*hHook*/, DWORD event,
-    HWND hwnd, LONG idObject, LONG /*idChild*/,
-    DWORD /*dwEventThread*/, DWORD /*dwmsEventTime*/)
-{
-    if (event == EVENT_OBJECT_LOCATIONCHANGE &&
-        hwnd == g_hTaskbar &&
-        idObject == OBJID_WINDOW)
-    {
-        UpdatePopupPositionNow();
-        BringWidgetToTop();
+static void SavePosition(int x, int y) {
+    HKEY hk;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, nullptr,
+                        REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                        nullptr, &hk, nullptr) == ERROR_SUCCESS) {
+        DWORD dx = (DWORD)x, dy = (DWORD)y;
+        RegSetValueExW(hk, L"X", 0, REG_DWORD, (BYTE*)&dx, sizeof(dx));
+        RegSetValueExW(hk, L"Y", 0, REG_DWORD, (BYTE*)&dy, sizeof(dy));
+        RegCloseKey(hk);
     }
 }
 
-// --------------------------------------------------------------------------
-// Регистрация хука на перемещение таскбара
-// --------------------------------------------------------------------------
-void InstallEventHook() {
-    if (!g_hEventHook && g_hTaskbar) {
-        DWORD taskbarThreadId = GetWindowThreadProcessId(g_hTaskbar, nullptr);
-        g_hEventHook = SetWinEventHook(
-            EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
-            NULL,
-            WinEventProcLocation,
-            0,
-            taskbarThreadId,
-            WINEVENT_OUTOFCONTEXT
-        );
-    }
+static bool LoadPosition(int& x, int& y) {
+    HKEY hk;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_KEY, 0,
+                      KEY_QUERY_VALUE, &hk) != ERROR_SUCCESS) return false;
+    DWORD dx = 0, dy = 0, sz = sizeof(DWORD);
+    bool ok =
+        RegQueryValueExW(hk, L"X", 0, nullptr, (BYTE*)&dx, &sz) == ERROR_SUCCESS &&
+        RegQueryValueExW(hk, L"Y", 0, nullptr, (BYTE*)&dy, &sz) == ERROR_SUCCESS;
+    RegCloseKey(hk);
+    if (ok) { x = (int)dx; y = (int)dy; }
+    return ok;
 }
 
-// --------------------------------------------------------------------------
-// PDH
-// --------------------------------------------------------------------------
-PDH_STATUS InitPDH() {
-    hNetDown = hNetUp = nullptr;
-    PDH_STATUS status = PdhOpenQueryW(nullptr, 0, &hQuery);
-    if (status != ERROR_SUCCESS) return status;
+// ── DWM rounded corners (Windows 11+) ────────────────────────────────────────
 
-    if (PdhAddEnglishCounterW(hQuery,
-            L"\\Network Interface(*)\\Bytes Received/sec", 0, &hNetDown) != ERROR_SUCCESS)
-        hNetDown = nullptr;
+static void ApplyRoundedCorners(HWND hwnd) {
+    // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
+    HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
+    if (!hDwm) return;
+    typedef HRESULT(WINAPI* PFN)(HWND, DWORD, LPCVOID, DWORD);
+    PFN fn = (PFN)GetProcAddress(hDwm, "DwmSetWindowAttribute");
+    if (fn) {
+        DWORD pref = 2; // DWMWCP_ROUND
+        fn(hwnd, 33, &pref, sizeof(pref));
+    }
+    FreeLibrary(hDwm);
+}
 
-    if (PdhAddEnglishCounterW(hQuery,
-            L"\\Network Interface(*)\\Bytes Sent/sec", 0, &hNetUp) != ERROR_SUCCESS)
-        hNetUp = nullptr;
+// ── PDH ───────────────────────────────────────────────────────────────────────
 
+static PDH_STATUS InitPDH() {
+    PDH_STATUS st = PdhOpenQueryW(nullptr, 0, &hQuery);
+    if (st != ERROR_SUCCESS) return st;
+    PdhAddEnglishCounterW(hQuery,
+        L"\\Network Interface(*)\\Bytes Received/sec", 0, &hNetDown);
+    PdhAddEnglishCounterW(hQuery,
+        L"\\Network Interface(*)\\Bytes Sent/sec",     0, &hNetUp);
     PdhCollectQueryData(hQuery);
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     PdhCollectQueryData(hQuery);
     return ERROR_SUCCESS;
 }
 
-// --------------------------------------------------------------------------
-// Суммирует значения wildcard-счётчика по всем интерфейсам
-// --------------------------------------------------------------------------
-static double SumCounterArray(PDH_HCOUNTER hCounter) {
-    if (!hCounter) return 0.0;
-
-    DWORD bufSize = 0, itemCount = 0;
-    PDH_STATUS st = PdhGetFormattedCounterArray(hCounter, PDH_FMT_DOUBLE,
-                                                &bufSize, &itemCount, nullptr);
-    if (st != (PDH_STATUS)0x800007D2L && st != ERROR_SUCCESS)
-        return 0.0;
-
-    std::vector<BYTE> buf(bufSize);
+static double SumCounterArray(PDH_HCOUNTER hCtr) {
+    if (!hCtr) return 0.0;
+    DWORD sz = 0, cnt = 0;
+    PDH_STATUS st = PdhGetFormattedCounterArray(
+        hCtr, PDH_FMT_DOUBLE, &sz, &cnt, nullptr);
+    if (st != (PDH_STATUS)0x800007D2L && st != ERROR_SUCCESS) return 0.0;
+    std::vector<BYTE> buf(sz);
     auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
-    st = PdhGetFormattedCounterArray(hCounter, PDH_FMT_DOUBLE,
-                                     &bufSize, &itemCount, items);
-    if (st != ERROR_SUCCESS)
+    if (PdhGetFormattedCounterArray(hCtr, PDH_FMT_DOUBLE,
+                                    &sz, &cnt, items) != ERROR_SUCCESS)
         return 0.0;
-
     double total = 0.0;
-    for (DWORD i = 0; i < itemCount; ++i) {
-        double val = items[i].FmtValue.doubleValue;
-        if (val >= 0.0 && !std::isnan(val) && !std::isinf(val))
-            total += val;
+    for (DWORD i = 0; i < cnt; ++i) {
+        double v = items[i].FmtValue.doubleValue;
+        if (v >= 0.0 && !std::isnan(v) && !std::isinf(v)) total += v;
     }
     return total;
 }
 
-std::wstring GetMetricsText() {
+static void FetchMetrics() {
     PdhCollectQueryData(hQuery);
+    double dn = SumCounterArray(hNetDown) / 1024.0;
+    double up = SumCounterArray(hNetUp)   / 1024.0;
+    wchar_t du = L'K'; if (dn >= 1024.0) { dn /= 1024.0; du = L'M'; }
+    wchar_t uu = L'K'; if (up >= 1024.0) { up /= 1024.0; uu = L'M'; }
 
-    // Суммируем трафик по всем сетевым интерфейсам
-    double netDown = SumCounterArray(hNetDown) / 1024.0;
-    double netUp   = SumCounterArray(hNetUp)   / 1024.0;
+    wchar_t vd[64], vu[64];
+    swprintf_s(vd, L" %5.1f %cB/s", dn, du);
+    swprintf_s(vu, L" %5.1f %cB/s", up, uu);
 
-    wchar_t downUnit = L'K';
-    if (netDown >= 1024.0) { netDown /= 1024.0; downUnit = L'M'; }
-
-    wchar_t upUnit = L'K';
-    if (netUp >= 1024.0) { netUp /= 1024.0; upUnit = L'M'; }
-
-    wchar_t buf[128];
-    swprintf_s(buf, L"D:%5.1f %cB/s\nU:%5.1f %cB/s", netDown, downUnit, netUp, upUnit);
-    return std::wstring(buf);
+    EnterCriticalSection(&g_cs);
+    g_lineDown = {L"\u25BC", vd};   // down arrow
+    g_lineUp   = {L"\u25B2", vu};   // up arrow
+    LeaveCriticalSection(&g_cs);
 }
 
-// --------------------------------------------------------------------------
-// WinMain
-// --------------------------------------------------------------------------
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-	
-	g_hMutex = CreateMutexW(NULL, TRUE, L"TaskbarWidgetPDH_Mutex");
+// ── Background thread ─────────────────────────────────────────────────────────
+
+DWORD WINAPI UpdateThread(LPVOID) {
+    while (g_keepRunning) {
+        FetchMetrics();
+        if (g_hPopup) PostMessageW(g_hPopup, WM_APP_UPDATE_METRICS, 0, 0);
+        Sleep(1000);
+    }
+    return 0;
+}
+
+// ── Painting ──────────────────────────────────────────────────────────────────
+// FillRect (background) + FrameRect (border) + DrawTextW (coloured text).
+// Overall transparency is handled by SetLayeredWindowAttributes(LWA_ALPHA),
+// so no per-pixel bitmap work is needed.
+
+static void PaintWidget(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+
+    RECT rc; GetClientRect(hwnd, &rc);
+
+    // Background
+    HBRUSH hBgBrush = CreateSolidBrush(CLR_BG);
+    FillRect(hdc, &rc, hBgBrush);
+    DeleteObject(hBgBrush);
+
+    // 1-px border
+    HBRUSH hBdBrush = CreateSolidBrush(CLR_BORDER);
+    FrameRect(hdc, &rc, hBdBrush);
+    DeleteObject(hBdBrush);
+
+    // Text
+    SetBkMode(hdc, TRANSPARENT);
+
+    EnterCriticalSection(&g_cs);
+    NetLine ld = g_lineDown;
+    NetLine lu = g_lineUp;
+    LeaveCriticalSection(&g_cs);
+
+    // Measure line height using value font
+    HFONT hOld = (HFONT)SelectObject(hdc, g_hFontValue);
+    TEXTMETRICW tm; GetTextMetricsW(hdc, &tm);
+    int lh = tm.tmHeight + tm.tmExternalLeading + 2;
+
+    int totalH = lh * 2;
+    int yBase  = (rc.bottom - totalH) / 2;
+
+    const int xPad  = 10;
+    const int arWid = 20;
+
+    // Draw one line: coloured arrow + monospaced value
+    auto DrawLine = [&](const NetLine& line, int y, COLORREF arrowClr) {
+        SelectObject(hdc, g_hFontArrow);
+        SetTextColor(hdc, arrowClr);
+        RECT rA = {xPad, y, xPad + arWid, y + lh};
+        DrawTextW(hdc, line.arrow.c_str(), -1, &rA,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(hdc, g_hFontValue);
+        SetTextColor(hdc, CLR_VAL);
+        RECT rV = {xPad + arWid, y, rc.right - xPad, y + lh};
+        DrawTextW(hdc, line.value.c_str(), -1, &rV,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    };
+
+    DrawLine(ld, yBase,      CLR_DN);
+    DrawLine(lu, yBase + lh, CLR_UP);
+
+    SelectObject(hdc, hOld);
+    EndPaint(hwnd, &ps);
+}
+
+// ── Window procedure ──────────────────────────────────────────────────────────
+
+LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+
+    case WM_CREATE:
+        g_hFontValue = CreateFontW(
+            -14, 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN,
+            L"Consolas");
+
+        g_hFontArrow = CreateFontW(
+            -13, 0, 0, 0, FW_BOLD,
+            FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
+            L"Segoe UI");
+
+        // Overall window transparency
+        SetLayeredWindowAttributes(hwnd, 0, WIN_ALPHA, LWA_ALPHA);
+
+        // DWM rounded corners (Windows 11+, silently ignored on older versions)
+        ApplyRoundedCorners(hwnd);
+        return 0;
+
+    case WM_PAINT:
+        PaintWidget(hwnd);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_APP_UPDATE_METRICS:
+        InvalidateRect(hwnd, NULL, FALSE);
+        UpdateWindow(hwnd);
+        return 0;
+
+    // All hit-testing returns HTCLIENT so we handle every mouse message
+    case WM_NCHITTEST:
+        return HTCLIENT;
+
+    // ── Drag ─────────────────────────────────────────────────────────────────
+    case WM_LBUTTONDOWN:
+        if (!g_isDragging) {
+            g_isDragging = true;
+            SetCapture(hwnd);
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(hwnd, &pt);
+            RECT wr; GetWindowRect(hwnd, &wr);
+            g_dragOffset = {pt.x - wr.left, pt.y - wr.top};
+        }
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (g_isDragging) {
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ClientToScreen(hwnd, &pt);
+            int nx = pt.x - g_dragOffset.x;
+            int ny = pt.y - g_dragOffset.y;
+            // Clamp to virtual desktop (multi-monitor aware)
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            nx = std::max(vx, std::min(nx, vx + vw - WIN_W));
+            ny = std::max(vy, std::min(ny, vy + vh - WIN_H));
+            SetWindowPos(hwnd, HWND_TOPMOST, nx, ny, 0, 0,
+                         SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (g_isDragging) {
+            g_isDragging = false;
+            ReleaseCapture();
+            RECT wr; GetWindowRect(hwnd, &wr);
+            SavePosition(wr.left, wr.top);
+        }
+        return 0;
+
+    // After a window-move (e.g. via NCLBUTTONDOWN trick), restore TOPMOST
+    case WM_EXITSIZEMOVE:
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        break;
+
+    // ── Double-click -> Task Manager ─────────────────────────────────────────
+    case WM_LBUTTONDBLCLK:
+        g_isDragging = false;
+        ReleaseCapture();
+        keybd_event(VK_CONTROL, 0, 0, 0);
+        keybd_event(VK_SHIFT,   0, 0, 0);
+        keybd_event(VK_ESCAPE,  0, 0, 0);
+        keybd_event(VK_ESCAPE,  0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_SHIFT,   0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+        return 0;
+
+    // ── Context menu ─────────────────────────────────────────────────────────
+    case WM_CONTEXTMENU: {
+        HMENU hMenu = CreatePopupMenu();
+        AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Закрыть");
+        POINT pt; GetCursorPos(&pt);
+        SetForegroundWindow(hwnd);
+        TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
+        DestroyMenu(hMenu);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDM_EXIT)
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        break;
+
+    // ── Cleanup ──────────────────────────────────────────────────────────────
+    case WM_DESTROY:
+        g_keepRunning = false;
+        if (g_updateThread) {
+            WaitForSingleObject(g_updateThread, 2000);
+            CloseHandle(g_updateThread);
+            g_updateThread = nullptr;
+        }
+        if (hQuery)        { PdhCloseQuery(hQuery); hQuery = nullptr; }
+        if (g_hFontValue)  { DeleteObject(g_hFontValue); g_hFontValue = nullptr; }
+        if (g_hFontArrow)  { DeleteObject(g_hFontArrow); g_hFontArrow = nullptr; }
+        if (g_hMutex)      { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); g_hMutex = nullptr; }
+        DeleteCriticalSection(&g_cs);
+        PostQuitMessage(0);
+        break;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// ── WinMain ───────────────────────────────────────────────────────────────────
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
+    g_hMutex = CreateMutexW(NULL, TRUE, L"NetMonitorWidget_Mutex_v3");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(g_hMutex);
         return 0;
     }
-    g_hInst       = hInstance;
-    g_screenHeight = GetSystemMetrics(SM_CYSCREEN);
 
+    g_hInst = hInst;
     InitializeCriticalSection(&g_cs);
+
+    // Placeholder text while PDH warms up
+    EnterCriticalSection(&g_cs);
+    g_lineDown = {L"\u25BC", L" ---.- KB/s"};
+    g_lineUp   = {L"\u25B2", L" ---.- KB/s"};
+    LeaveCriticalSection(&g_cs);
+
     InitPDH();
 
-    WNDCLASSEX wc     = {sizeof(WNDCLASSEX)};
-    wc.style          = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    wc.lpfnWndProc    = PopupWndProc;
-    wc.hInstance      = hInstance;
-    wc.hCursor        = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground  = NULL;
-    wc.lpszClassName  = L"TaskbarWidgetPDH";
-    wc.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
-    wc.hIconSm        = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APPICON));
+    WNDCLASSEX wc    = {sizeof(WNDCLASSEX)};
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc   = PopupWndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(NULL, IDC_SIZEALL);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = L"NetMonitorWidget";
+    wc.hIcon         = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
+    wc.hIconSm       = LoadIcon(hInst, MAKEINTRESOURCE(IDI_APPICON));
     RegisterClassEx(&wc);
 
-    FindTaskbar();
-
-    RECT taskbarRect = {0};
-    if (g_hTaskbar) {
-        GetWindowRect(g_hTaskbar, &taskbarRect);
-
-        HWND hTrayNotifyWnd = FindWindowEx(g_hTaskbar, NULL, L"TrayNotifyWnd", NULL);
-        if (hTrayNotifyWnd) {
-            RECT trayNotifyRect = {0};
-            GetWindowRect(hTrayNotifyWnd, &trayNotifyRect);
-            if (taskbarRect.right > 0 && trayNotifyRect.left > 0)
-                g_xOffset = taskbarRect.right - trayNotifyRect.left;
-        }
+    int x, y;
+    if (!LoadPosition(x, y)) {
+        x = GetSystemMetrics(SM_CXSCREEN) - WIN_W - 24;
+        y = 24;
     }
-
-    int x = taskbarRect.right - g_popupWidth - g_xOffset;
-    int y = taskbarRect.top   + g_yOffset;
 
     g_hPopup = CreateWindowEx(
         WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW,
-        L"TaskbarWidgetPDH", L"",
+        L"NetMonitorWidget", L"",
         WS_POPUP | WS_VISIBLE,
-        x, y, g_popupWidth, g_popupHeight,
-        NULL, NULL, hInstance, NULL);
+        x, y, WIN_W, WIN_H,
+        NULL, NULL, hInst, NULL);
 
-    if (!g_hPopup) {
-        MessageBoxW(NULL, L"Ошибка создания окна", L"Ошибка", MB_ICONERROR);
-        return 0;
-    }
-
-    // Устанавливаем хук на события таскбара
-    InstallEventHook();
-
-    // Watchdog: раз в 500 мс проверяем, жив ли таскбар
-    SetTimer(g_hPopup, ID_TIMER_WATCHDOG, 500, NULL);
-    SetTimer(g_hPopup, ID_TIMER_ZORDER, 1, NULL);
+    if (!g_hPopup) return 1;
 
     g_updateThread = CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
 
@@ -326,166 +421,5 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-
     return 0;
-}
-
-// --------------------------------------------------------------------------
-bool FindTaskbar() {
-    g_hTaskbar = FindWindow(L"Shell_TrayWnd", NULL);
-    return g_hTaskbar != NULL;
-}
-
-void UpdatePopupPositionNow() {
-    if (!g_hTaskbar) {
-        FindTaskbar();
-        if (!g_hTaskbar) return;
-    }
-
-    RECT taskbarRect;
-    if (!GetWindowRect(g_hTaskbar, &taskbarRect)) return;
-
-    if (taskbarRect.top    == g_lastTaskbarRect.top    &&
-        taskbarRect.bottom == g_lastTaskbarRect.bottom &&
-        taskbarRect.right  == g_lastTaskbarRect.right)
-        return;
-
-    int x = taskbarRect.right - g_popupWidth - g_xOffset;
-    int y = taskbarRect.top   + g_yOffset;
-
-    SetWindowPos(g_hPopup, HWND_TOPMOST, x, y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
-
-    g_lastTaskbarRect = taskbarRect;
-}
-
-HFONT CreateMono15Light() {
-    return CreateFontW(
-        -12, 0, 0, 0, 400,
-        FALSE, FALSE, FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY, FIXED_PITCH,
-        L"Courier New");
-}
-
-// --------------------------------------------------------------------------
-// Оконная процедура
-// --------------------------------------------------------------------------
-LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-        case WM_CREATE:
-            g_hFont = CreateMono15Light();
-            UpdateLayeredPopup(hwnd);
-            return 0;
-
-        case WM_TIMER:
-            if (wParam == ID_TIMER_ZORDER) {
-                // Если таскбар на переднем плане - немедленно поднимаем виджет.
-                 if (g_hTaskbar && ::GetForegroundWindow() == g_hTaskbar)
-                    BringWidgetToTop();
-                break;
-            }
-            if (wParam == ID_TIMER_WATCHDOG) {
-                // Если таскбар пропал (Explorer перезапустился) - переподключаемся
-                if (!g_hTaskbar || !IsWindow(g_hTaskbar)) {
-                    if (g_hEventHook) {
-                        UnhookWinEvent(g_hEventHook);
-                        g_hEventHook = nullptr;
-                    }
-                    g_hTaskbar = NULL;
-                    if (FindTaskbar()) {
-                        RECT taskbarRect = {0}, trayNotifyRect = {0};
-                        GetWindowRect(g_hTaskbar, &taskbarRect);
-                        HWND hTray = FindWindowEx(g_hTaskbar, NULL, L"TrayNotifyWnd", NULL);
-                        if (hTray) {
-                            GetWindowRect(hTray, &trayNotifyRect);
-                            if (taskbarRect.right > 0 && trayNotifyRect.left > 0)
-                                g_xOffset = taskbarRect.right - trayNotifyRect.left;
-                        }
-                        InstallEventHook();
-                        UpdatePopupPositionNow();
-                    }
-                }
-            }
-            break;
-
-        case WM_COMMAND:
-            if (LOWORD(wParam) == IDM_EXIT)
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            break;
-
-        case WM_CONTEXTMENU: {
-            HMENU hMenu = CreatePopupMenu();
-            AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Закрыть");
-            POINT pt;
-            GetCursorPos(&pt);
-            TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, NULL);
-            DestroyMenu(hMenu);
-            return 0;
-        }
-
-        case WM_LBUTTONDBLCLK:
-            // Симулируем Ctrl+Shift+Esc
-            keybd_event(VK_CONTROL, 0, 0, 0);
-            keybd_event(VK_SHIFT,   0, 0, 0);
-            keybd_event(VK_ESCAPE,  0, 0, 0);
-            keybd_event(VK_ESCAPE,  0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_SHIFT,   0, KEYEVENTF_KEYUP, 0);
-            keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-            return 0;
-
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            BeginPaint(hwnd, &ps);
-            EndPaint(hwnd, &ps);
-            return 0;
-        }
-
-        case WM_ERASEBKGND:
-            return 1;
-
-        case WM_NCHITTEST:
-            return HTCLIENT;
-
-        case WM_APP_UPDATE_METRICS:
-            UpdateLayeredPopup(hwnd);
-            return 0;
-
-        case WM_DESTROY:
-            // Останавливаем фоновый поток
-            g_keepRunning = false;
-            if (g_updateThread) {
-                WaitForSingleObject(g_updateThread, 2000);
-                CloseHandle(g_updateThread);
-                g_updateThread = nullptr;
-            }
-            // Снимаем WinEvent-хук
-            if (g_hEventHook) {
-                UnhookWinEvent(g_hEventHook);
-                g_hEventHook = nullptr;
-            }
-            // PDH cleanup
-            if (hQuery) {
-                PdhCloseQuery(hQuery);
-                hQuery = nullptr;
-            }
-            KillTimer(hwnd, ID_TIMER_WATCHDOG);
-            KillTimer(hwnd, ID_TIMER_ZORDER);
-			
-            if (g_hFont) {
-                DeleteObject(g_hFont);
-                g_hFont = nullptr;
-            }
-			if (g_hMutex) {
-                ReleaseMutex(g_hMutex);
-                CloseHandle(g_hMutex);
-                g_hMutex = nullptr;
-            }
-            DeleteCriticalSection(&g_cs);
-            PostQuitMessage(0);
-            break;
-    }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
