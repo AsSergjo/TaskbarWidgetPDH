@@ -18,15 +18,19 @@
 
 #include "resource.h"
 
-// ── IDs ───────────────────────────────────────────────────────────────────────
+//IDs
 #define IDM_EXIT              101
 #define WM_APP_UPDATE_METRICS (WM_APP + 1)
 
-// ── Window geometry ───────────────────────────────────────────────────────────
-static const int WIN_W = 140;
-static const int WIN_H =  62;
+// Window geometry
+static const int WIN_W = 166;
+static const int WIN_H = 62;
 
-// ── Visual style ──────────────────────────────────────────────────────────────
+// Side buttons (mode selector)
+static const int SQBUTTON_W = 14;
+static const int SQBUTTON_PAD = 4;
+
+// Visual style
 // Overall window alpha (0-255).  220 ~= 86 % — feels solid but clearly see-through.
 static const BYTE WIN_ALPHA = 220;
 
@@ -37,22 +41,32 @@ static const COLORREF CLR_BORDER = RGB(100, 105, 115);
 static const COLORREF CLR_DN = RGB(120, 230, 255);
 static const COLORREF CLR_UP = RGB(255, 200, 80);
 static const COLORREF CLR_VAL = RGB(255, 255, 255);
+static const COLORREF CLR_CPU = RGB(120, 230, 255);
+static const COLORREF CLR_DSK = RGB(120, 255, 120);
+static const COLORREF CLR_MEM_A = RGB(120, 230, 255);
+static const COLORREF CLR_MEM_U = RGB(120, 255, 120);
 
-// ── Registry key ──────────────────────────────────────────────────────────────
+// Registry key
 static const wchar_t* REG_KEY = L"Software\\NetMonitorWidget";
 
-// ── Globals ───────────────────────────────────────────────────────────────────
+//Globals
 HINSTANCE        g_hInst        = NULL;
 HWND             g_hPopup       = NULL;
 HANDLE           g_hMutex       = NULL;
 CRITICAL_SECTION g_cs;
 
+enum class DisplayMode { Network, CpuDisk, Memory };
+DisplayMode g_currentMode = DisplayMode::Network;
+
 // Fonts: created once in WM_CREATE, deleted in WM_DESTROY
-HFONT g_hFontArrow = NULL;   // arrow glyph font
+
 HFONT g_hFontValue = NULL;   // monospaced value font
+HFONT g_hFontFluent = NULL;  // Segoe Fluent Icons для CPU/Disk/Mem
 
 PDH_HQUERY   hQuery   = nullptr;
 PDH_HCOUNTER hNetDown = nullptr, hNetUp = nullptr;
+PDH_HCOUNTER hCpu = nullptr, hDiskTime = nullptr;
+PDH_HCOUNTER hMemAvail = nullptr, hMemUsed = nullptr;
 
 std::atomic<bool> g_keepRunning{true};
 HANDLE            g_updateThread = nullptr;
@@ -60,6 +74,8 @@ HANDLE            g_updateThread = nullptr;
 // Two separate strings so we can colour them independently in WM_PAINT
 struct NetLine { std::wstring arrow; std::wstring value; };
 NetLine g_lineDown, g_lineUp;
+NetLine g_lineCpu, g_lineDisk;
+NetLine g_lineMemAvail, g_lineMemUsed;
 
 // Drag state
 bool  g_isDragging = false;
@@ -67,8 +83,7 @@ POINT g_dragOffset = {};
 
 LRESULT CALLBACK PopupWndProc(HWND, UINT, WPARAM, LPARAM);
 
-// ── Registry helpers ──────────────────────────────────────────────────────────
-
+//Registry helpers
 static void SavePosition(int x, int y) {
     HKEY hk;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_KEY, 0, nullptr,
@@ -94,8 +109,7 @@ static bool LoadPosition(int& x, int& y) {
     return ok;
 }
 
-// ── DWM rounded corners (Windows 11+) ────────────────────────────────────────
-
+//DWM rounded corners (Windows 11+)
 static void ApplyRoundedCorners(HWND hwnd) {
     // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
     HMODULE hDwm = LoadLibraryW(L"dwmapi.dll");
@@ -109,15 +123,24 @@ static void ApplyRoundedCorners(HWND hwnd) {
     FreeLibrary(hDwm);
 }
 
-// ── PDH ───────────────────────────────────────────────────────────────────────
-
+//PDH
 static PDH_STATUS InitPDH() {
     PDH_STATUS st = PdhOpenQueryW(nullptr, 0, &hQuery);
     if (st != ERROR_SUCCESS) return st;
+
     PdhAddEnglishCounterW(hQuery,
         L"\\Network Interface(*)\\Bytes Received/sec", 0, &hNetDown);
     PdhAddEnglishCounterW(hQuery,
         L"\\Network Interface(*)\\Bytes Sent/sec",     0, &hNetUp);
+    PdhAddEnglishCounterW(hQuery,
+        L"\\Processor Information(_Total)\\% Processor Time", 0, &hCpu);
+    PdhAddEnglishCounterW(hQuery,
+        L"\\PhysicalDisk(_Total)\\% Disk Time", 0, &hDiskTime);
+    PdhAddEnglishCounterW(hQuery,
+        L"\\Memory\\Available MBytes", 0, &hMemAvail);
+    PdhAddEnglishCounterW(hQuery,
+        L"\\Memory\\% Committed Bytes In Use", 0, &hMemUsed);
+
     PdhCollectQueryData(hQuery);
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     PdhCollectQueryData(hQuery);
@@ -143,6 +166,15 @@ static double SumCounterArray(PDH_HCOUNTER hCtr) {
     return total;
 }
 
+static double GetCounterValue(PDH_HCOUNTER hCtr) {
+    if (!hCtr) return 0.0;
+    PDH_FMT_COUNTERVALUE val;
+    if (PdhGetFormattedCounterValue(hCtr, PDH_FMT_DOUBLE,
+                                    nullptr, &val) != ERROR_SUCCESS) return 0.0;
+    double v = val.doubleValue;
+    return (v >= 0.0 && !std::isnan(v) && !std::isinf(v)) ? v : 0.0;
+}
+
 static void FetchMetrics() {
     PdhCollectQueryData(hQuery);
     double dn = SumCounterArray(hNetDown) / 1024.0;
@@ -154,14 +186,35 @@ static void FetchMetrics() {
     swprintf_s(vd, L" %5.1f %cB/s", dn, du);
     swprintf_s(vu, L" %5.1f %cB/s", up, uu);
 
+    double cpu = GetCounterValue(hCpu);
+    double dsk = GetCounterValue(hDiskTime);
+    wchar_t vc[64], vk[64];
+    swprintf_s(vc, L" %5.1f %%", cpu);
+    swprintf_s(vk, L" %5.1f %%", dsk);
+
+    double memAvail = GetCounterValue(hMemAvail);
+    double memUsed  = GetCounterValue(hMemUsed);
+    wchar_t vma[64], vmu[64];
+    if (memAvail >= 1024.0) {
+        swprintf_s(vma, L" %5.1f GB", memAvail / 1024.0);
+    } else {
+        swprintf_s(vma, L" %5.0f MB", memAvail);
+    }
+    swprintf_s(vmu, L" %5.1f %%", memUsed);
+ 
     EnterCriticalSection(&g_cs);
-    g_lineDown = {L"\u25BC", vd};   // down arrow
-    g_lineUp   = {L"\u25B2", vu};   // up arrow
+	
+    g_lineDown =        {L"\uf08e", vd};   // down arrow
+    g_lineUp   =          {L"\uf090", vu};   // up arrow
+    g_lineCpu   =        {L"\uEEA1", vc};   // CPU       - % Processor Time
+    g_lineDisk  =         {L"\uEDA2", vk};   // HardDrive - % Disk Time
+    g_lineMemAvail =  {L"\uEEA0", vma};   // RAM       - Available MBytes
+    g_lineMemUsed  = {L"\uF164", vmu};   // custom    - % Committed Bytes In Use
+	
     LeaveCriticalSection(&g_cs);
 }
 
-// ── Background thread ─────────────────────────────────────────────────────────
-
+//Background thread
 DWORD WINAPI UpdateThread(LPVOID) {
     while (g_keepRunning) {
         FetchMetrics();
@@ -171,70 +224,99 @@ DWORD WINAPI UpdateThread(LPVOID) {
     return 0;
 }
 
-// ── Painting ──────────────────────────────────────────────────────────────────
-// FillRect (background) + FrameRect (border) + DrawTextW (coloured text).
-// Overall transparency is handled by SetLayeredWindowAttributes(LWA_ALPHA),
-// so no per-pixel bitmap work is needed.
-
+//Painting
 static void PaintWidget(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
 
     RECT rc; GetClientRect(hwnd, &rc);
+    int w = rc.right  - rc.left;
+    int h = rc.bottom - rc.top;
 
+    // Double-buffer setup
+    HDC     memDC  = CreateCompatibleDC(hdc);
+    HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
     // Background
     HBRUSH hBgBrush = CreateSolidBrush(CLR_BG);
-    FillRect(hdc, &rc, hBgBrush);
+    FillRect(memDC, &rc, hBgBrush);
     DeleteObject(hBgBrush);
-
     // 1-px border
     HBRUSH hBdBrush = CreateSolidBrush(CLR_BORDER);
-    FrameRect(hdc, &rc, hBdBrush);
+    FrameRect(memDC, &rc, hBdBrush);
     DeleteObject(hBdBrush);
 
+    SetBkMode(memDC, TRANSPARENT);
+
+    // Three mode-selector squares on the right
+    const int sqW = 14, pad = 4;
+    const int sqX = rc.right - sqW - pad - 2;
+    RECT sq[3];
+    for (int i = 0; i < 3; ++i) {
+        sq[i] = {sqX, pad + i * (sqW + pad), sqX + sqW, pad + (i + 1) * sqW + i * pad};
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        bool isCurrent = (int)g_currentMode == i;
+        COLORREF c = isCurrent ? CLR_VAL : CLR_BORDER;
+        SelectObject(memDC, g_hFontFluent);
+        SetTextColor(memDC, c);
+        DrawTextW(memDC, L"\ue915", -1, &sq[i],
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
+
     // Text
-    SetBkMode(hdc, TRANSPARENT);
-
     EnterCriticalSection(&g_cs);
-    NetLine ld = g_lineDown;
-    NetLine lu = g_lineUp;
+    NetLine line1 = g_lineDown, line2 = g_lineUp;
+    if (g_currentMode == DisplayMode::CpuDisk) { line1 = g_lineCpu; line2 = g_lineDisk; }
+    if (g_currentMode == DisplayMode::Memory)  { line1 = g_lineMemAvail; line2 = g_lineMemUsed; }
     LeaveCriticalSection(&g_cs);
-
-    // Measure line height using value font
-    HFONT hOld = (HFONT)SelectObject(hdc, g_hFontValue);
-    TEXTMETRICW tm; GetTextMetricsW(hdc, &tm);
+    // Measure line height
+    HFONT hOld = (HFONT)SelectObject(memDC, g_hFontValue);
+    TEXTMETRICW tm; GetTextMetricsW(memDC, &tm);
     int lh = tm.tmHeight + tm.tmExternalLeading + 2;
 
     int totalH = lh * 2;
     int yBase  = (rc.bottom - totalH) / 2;
 
     const int xPad  = 10;
-    const int arWid = 20;
+    const int arWid = 30; // wider for "CPU", "Disk"
 
-    // Draw one line: coloured arrow + monospaced value
     auto DrawLine = [&](const NetLine& line, int y, COLORREF arrowClr) {
-        SelectObject(hdc, g_hFontArrow);
-        SetTextColor(hdc, arrowClr);
+          
+        SelectObject(memDC, g_hFontFluent);
+        SetTextColor(memDC, arrowClr);
         RECT rA = {xPad, y, xPad + arWid, y + lh};
-        DrawTextW(hdc, line.arrow.c_str(), -1, &rA,
+        DrawTextW(memDC, line.arrow.c_str(), -1, &rA,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-        SelectObject(hdc, g_hFontValue);
-        SetTextColor(hdc, CLR_VAL);
-        RECT rV = {xPad + arWid, y, rc.right - xPad, y + lh};
-        DrawTextW(hdc, line.value.c_str(), -1, &rV,
+        SelectObject(memDC, g_hFontValue);
+        SetTextColor(memDC, CLR_VAL);
+        // Shrink value rect to not overlap squares
+        RECT rV = {xPad + arWid, y, rc.right - xPad - sqW - pad, y + lh};
+        DrawTextW(memDC, line.value.c_str(), -1, &rV,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     };
 
-    DrawLine(ld, yBase,      CLR_DN);
-    DrawLine(lu, yBase + lh, CLR_UP);
+    COLORREF clr1 = CLR_DN, clr2 = CLR_UP;
+    if (g_currentMode == DisplayMode::CpuDisk) { clr1 = CLR_CPU; clr2 = CLR_DSK; }
+    if (g_currentMode == DisplayMode::Memory)  { clr1 = CLR_MEM_A; clr2 = CLR_MEM_U; }
 
-    SelectObject(hdc, hOld);
+    DrawLine(line1, yBase,      clr1);
+    DrawLine(line2, yBase + lh, clr2);
+
+    SelectObject(memDC, hOld);
+
+    // Flush the completed frame to the screen.
+    BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+    // Clean up off-screen resources.
+    SelectObject(memDC, oldBmp);
+    DeleteObject(memBmp);
+    DeleteDC(memDC);
+
     EndPaint(hwnd, &ps);
 }
 
-// ── Window procedure ──────────────────────────────────────────────────────────
-
+// Window procedure
 LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
 
@@ -245,13 +327,13 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN,
             L"Consolas");
-
-        g_hFontArrow = CreateFontW(
-            -13, 0, 0, 0, FW_BOLD,
+			
+		g_hFontFluent = CreateFontW(
+           -14, 0, 0, 0, FW_NORMAL,
             FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS,
-            L"Segoe UI");
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            L"Segoe Fluent Icons");
 
         // Overall window transparency
         SetLayeredWindowAttributes(hwnd, 0, WIN_ALPHA, LWA_ALPHA);
@@ -276,17 +358,34 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_NCHITTEST:
         return HTCLIENT;
 
-    // ── Drag ─────────────────────────────────────────────────────────────────
-    case WM_LBUTTONDOWN:
+    // Drag
+    case WM_LBUTTONDOWN: {
+        POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+
+        // Check if click is on one of the side buttons
+        RECT rc; GetClientRect(hwnd, &rc);
+        const int sqW = 18, pad = 4;
+        const int sqX = rc.right - sqW - pad;
+        RECT sq[3];
+        for (int i = 0; i < 3; ++i) {
+            sq[i] = {sqX, pad + i * (sqW + pad), sqX + sqW, pad + (i + 1) * sqW + i * pad};
+            if (PtInRect(&sq[i], pt)) {
+                g_currentMode = (DisplayMode)i;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0; // Handled: don't start drag
+            }
+        }
+
+        // If not on a button, start dragging
         if (!g_isDragging) {
             g_isDragging = true;
             SetCapture(hwnd);
-            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             ClientToScreen(hwnd, &pt);
             RECT wr; GetWindowRect(hwnd, &wr);
             g_dragOffset = {pt.x - wr.left, pt.y - wr.top};
         }
         return 0;
+    }
 
     case WM_MOUSEMOVE:
         if (g_isDragging) {
@@ -321,19 +420,34 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         break;
 
-    // ── Double-click -> Task Manager ─────────────────────────────────────────
-    case WM_LBUTTONDBLCLK:
+    // Double-click -> Task Manager
+    case WM_LBUTTONDBLCLK: {
         g_isDragging = false;
         ReleaseCapture();
-        keybd_event(VK_CONTROL, 0, 0, 0);
-        keybd_event(VK_SHIFT,   0, 0, 0);
-        keybd_event(VK_ESCAPE,  0, 0, 0);
-        keybd_event(VK_ESCAPE,  0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_SHIFT,   0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-        return 0;
+        
+        INPUT inputs[6] = {};
+        inputs[0].type = INPUT_KEYBOARD;
+        inputs[0].ki.wVk = VK_CONTROL;
+        inputs[1].type = INPUT_KEYBOARD;
+        inputs[1].ki.wVk = VK_SHIFT;
+        inputs[2].type = INPUT_KEYBOARD;
+        inputs[2].ki.wVk = VK_ESCAPE;
+        
+        inputs[3].type = INPUT_KEYBOARD;
+        inputs[3].ki.wVk = VK_ESCAPE;
+        inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs[4].type = INPUT_KEYBOARD;
+        inputs[4].ki.wVk = VK_SHIFT;
+        inputs[4].ki.dwFlags = KEYEVENTF_KEYUP;
+        inputs[5].type = INPUT_KEYBOARD;
+        inputs[5].ki.wVk = VK_CONTROL;
+        inputs[5].ki.dwFlags = KEYEVENTF_KEYUP;
 
-    // ── Context menu ─────────────────────────────────────────────────────────
+        SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+        return 0;
+    }
+
+    // Context menu
     case WM_CONTEXTMENU: {
         HMENU hMenu = CreatePopupMenu();
         AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"Закрыть");
@@ -349,7 +463,7 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             PostMessageW(hwnd, WM_CLOSE, 0, 0);
         break;
 
-    // ── Cleanup ──────────────────────────────────────────────────────────────
+    // Cleanup
     case WM_DESTROY:
         g_keepRunning = false;
         if (g_updateThread) {
@@ -359,7 +473,7 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         if (hQuery)        { PdhCloseQuery(hQuery); hQuery = nullptr; }
         if (g_hFontValue)  { DeleteObject(g_hFontValue); g_hFontValue = nullptr; }
-        if (g_hFontArrow)  { DeleteObject(g_hFontArrow); g_hFontArrow = nullptr; }
+		if (g_hFontFluent) { DeleteObject(g_hFontFluent); g_hFontFluent = nullptr; }
         if (g_hMutex)      { ReleaseMutex(g_hMutex); CloseHandle(g_hMutex); g_hMutex = nullptr; }
         DeleteCriticalSection(&g_cs);
         PostQuitMessage(0);
@@ -368,8 +482,7 @@ LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// ── WinMain ───────────────────────────────────────────────────────────────────
-
+//WinMain
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     g_hMutex = CreateMutexW(NULL, TRUE, L"NetMonitorWidget_Mutex_v3");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -379,14 +492,30 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
 
     g_hInst = hInst;
     InitializeCriticalSection(&g_cs);
-
     // Placeholder text while PDH warms up
     EnterCriticalSection(&g_cs);
-    g_lineDown = {L"\u25BC", L" ---.- KB/s"};
-    g_lineUp   = {L"\u25B2", L" ---.- KB/s"};
+    g_lineDown = {L"\uf08e", L" ---.- KB/s"};
+    g_lineUp   = {L"\uf090", L" ---.- KB/s"};
+    g_lineCpu      = {L"\uEE77", L"  ---.- %"};
+    g_lineDisk     = {L"\uE950", L"  ---.- %"};
+    g_lineMemAvail = {L"\uE7F1", L" ---.- GB"};
+    g_lineMemUsed  = {L"\uEE6D", L"  ---.- %"};
     LeaveCriticalSection(&g_cs);
 
-    InitPDH();
+    PDH_STATUS pdhStatus = InitPDH();
+    if (pdhStatus != ERROR_SUCCESS) {
+        wchar_t msg[256];
+        swprintf_s(msg, L"Не удалось инициализировать счётчики производительности (PDH).\n"
+                        L"Возможно, они повреждены.\n\n"
+                        L"Код ошибки: 0x%08X\n\n"
+                        L"Попробуйте выполнить 'lodctr /R' в командной строке от имени администратора.",
+                   pdhStatus);
+        MessageBoxW(NULL, msg, L"Ошибка NetMonitorWidget", MB_OK | MB_ICONERROR);
+        ReleaseMutex(g_hMutex);
+        CloseHandle(g_hMutex);
+        DeleteCriticalSection(&g_cs);
+        return 1;
+    }
 
     WNDCLASSEX wc    = {sizeof(WNDCLASSEX)};
     wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
